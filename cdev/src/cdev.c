@@ -16,6 +16,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define DRIVER_NAME "cdevice"
 // device count
 #define DEVICE_NUMS 4
+#define TIMEOUT_SEC 5
 
 // 0 is dynamic allocation
 static int cdevice_major = 0;
@@ -28,8 +29,59 @@ static struct class *cdevice_class = NULL;
 
 struct cdevice_data {
     unsigned char val;
-    rwlock_t lock;
+    // timer
+    struct timer_list timer;
+    // lock for timer
+    spinlock_t lock;
+    // event queue
+    wait_queue_head_t wait_queue;
+    // just a flag to know data is ready
+    int timeout_done;
+    // critical section for read/write
+    struct semaphore sem;
 };
+
+static void cdevice_timeout_cb(struct timer_list *t)
+{
+    struct cdevice_data *p = from_timer(p, t, timer);
+    unsigned long flags;
+
+    printk("timer callback\n");
+
+    spin_lock_irqsave(&p->lock, flags);
+
+    p->timeout_done = 1;
+    // notify
+    wake_up_interruptible(&p->wait_queue);
+
+    spin_unlock_irqrestore(&p->lock, flags);
+
+    // restart timer
+    mod_timer(&p->timer, jiffies + TIMEOUT_SEC*HZ);
+}
+
+// at user space, no matter select or poll, both are calling .poll system call
+unsigned int cdevice_poll(struct file *file, poll_table *wait)
+{
+    struct cdevice_data *p = file->private_data;
+    // it is writable
+    unsigned int mask = POLLOUT | POLLWRNORM;
+
+    if (!p) {
+        return -EBADFD;
+    }
+
+    down(&p->sem);
+    // block and wait notify
+    poll_wait(file, &p->wait_queue, wait);
+    // someone notified
+    if (p->timeout_done == 1) {
+        // read is ready
+        mask |= POLLIN | POLLRDNORM;
+    }
+    up(&p->sem);
+    return mask;
+}
 
 static int cdevice_open(struct inode *inode, struct file *file)
 {
@@ -45,8 +97,15 @@ static int cdevice_open(struct inode *inode, struct file *file)
     }
 
     p->val = 0xff - iminor(inode);
-    rwlock_init(&p->lock);
     file->private_data = p;
+    spin_lock_init(&p->lock);
+    init_waitqueue_head(&p->wait_queue);
+    sema_init(&p->sem, 1);
+
+    timer_setup(&p->timer, cdevice_timeout_cb, 0);
+    // start timer
+    p->timeout_done = 0;
+    mod_timer(&p->timer, jiffies + TIMEOUT_SEC*HZ);
 out:
     return ret;
 }
@@ -55,8 +114,10 @@ static int cdevice_close(struct inode *inode, struct file *file)
 {
     printk("%s: major:%d minor:%d (pid:%d)\n", __func__,
             imajor(inode), iminor(inode), current->pid);
-    if (file->private_data) {
-        kfree(file->private_data);
+    struct cdevice_data *p = file->private_data;
+    if (p) {
+        del_timer_sync(&p->timer);
+        kfree(p);
     }
     return 0;
 }
@@ -70,17 +131,19 @@ ssize_t cdevice_write(struct file *file, const char __user *buf,
 
     printk("%s: count %lu pos %lld\n", __func__, count, *f_pos);
 
+    if (down_interruptible(&p->sem)) {
+        return -ERESTARTSYS;
+    }
     if (count >= 1) {
         if (copy_from_user(&val, buf, 1)) {
             write_count = -EFAULT;
             goto out;
         }
-        write_lock(&p->lock);
         p->val = val;
-        write_unlock(&p->lock);
     }
     write_count = count;
 out:
+    up(&p->sem);
     return write_count;
 }
 
@@ -91,13 +154,35 @@ ssize_t cdevice_read(struct file *file, char __user *buf,
     unsigned char val;
     ssize_t read_count;
     int i = 0;
+    int ret = 0;
 
-    read_lock(&p->lock);
-    val = p->val;
-    read_unlock(&p->lock);
+    if (down_interruptible(&p->sem)) {
+        return -ERESTARTSYS;
+    }
+
+    // read is not ready
+    if (p->timeout_done == 0) {
+        up(&p->sem);
+        // non-blocking mode
+        if (file->f_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+        // blocking mode
+        do {
+             ret = wait_event_interruptible_timeout(
+                     p->wait_queue, p->timeout_done == 1, 1*HZ);
+             if (ret == -ERESTARTSYS) {
+                 return -ERESTARTSYS;
+             }
+        } while (ret == 0); // if timeout, do it again
+        // read is ready, lock again
+        if (down_interruptible(&p->sem)) {
+            return -ERESTARTSYS;
+        }
+    }
 
     printk("%s: count %lu pos %lld\n", __func__, count, *f_pos);
-
+    val = p->val;
     for (i = 0; i < count; ++i) {
         if (copy_to_user(&buf[i], &val, 1)) {
             read_count = -EFAULT;
@@ -106,6 +191,8 @@ ssize_t cdevice_read(struct file *file, char __user *buf,
     }
     read_count = count;
 out:
+    p->timeout_done = 0;
+    up(&p->sem);
     return read_count;
 }
 
@@ -118,6 +205,9 @@ long cdevice_ioctl(struct file *file,
 
     memset(&data, 0x00, sizeof(data));
 
+    if (down_interruptible(&p->sem)) {
+        return -ERESTARTSYS;
+    }
     switch (cmd) {
         case IOCTL_SET_VAL:
             if (!capable(CAP_SYS_ADMIN)) {
@@ -135,10 +225,8 @@ long cdevice_ioctl(struct file *file,
                 ret = -EFAULT;
                 break;
             }
-            printk("ioctl: %d, set val: 0x%x\n", data.val);
-            write_lock(&p->lock);
+            printk("ioctl: set val: 0x%x\n", data.val);
             p->val = data.val;
-            write_unlock(&p->lock);
             break;
         case IOCTL_GET_VAL:
             if (!access_ok((void __user *)arg, _IOC_SIZE(cmd))) {
@@ -146,9 +234,7 @@ long cdevice_ioctl(struct file *file,
                 ret = -EFAULT;
                 break;
             }
-            read_lock(&p->lock);
             data.val = p->val;
-            read_unlock(&p->lock);
             if (copy_to_user((int __user *)arg, &data, sizeof(data))) {
                 printk("fail to copy data to user\n");
                 ret = -EFAULT;
@@ -159,6 +245,7 @@ long cdevice_ioctl(struct file *file,
             ret = -ENOTTY;
             break;
     }
+    up(&p->sem);
     return ret;
 }
 
@@ -168,6 +255,7 @@ struct file_operations cdevice_fops = {
     .write = cdevice_write,
     .read = cdevice_read,
     .unlocked_ioctl = cdevice_ioctl,
+    .poll = cdevice_poll,
 };
 
 static int cdevice_init(void)
