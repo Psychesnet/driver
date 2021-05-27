@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 
-#define CDEVICE "/dev/cdevice"
+#define CDEVICE "/dev/cdevice0"
 
 int main(int argc, char *argv[])
 {

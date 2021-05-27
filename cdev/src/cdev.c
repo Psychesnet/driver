@@ -6,8 +6,8 @@
 #include <linux/cdev.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/device.h>
 #include <linux/uaccess.h>
-#include <asm/current.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 
@@ -15,11 +15,17 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 // 0 is dynamic allocation
 static int cdevice_major = 0;
+// 0 is static assign
+static int cdevice_minor = 0;
 // device count
 static int cdevice_count = 1;
 // accept param when insmod
 module_param(cdevice_major, uint, 0);
+// global device status
 static struct cdev cdevice_cdev;
+// class for udev
+static struct class *cdevice_class = NULL;
+static dev_t cdevice_devt;
 
 struct cdevice_data {
     unsigned char val;
@@ -114,27 +120,44 @@ struct file_operations cdevice_fops = {
 static int cdevice_init(void)
 {
     int ret = 0;
+    // just create dev_t
     dev_t dev = MKDEV(cdevice_major, 0);
 
+    // ask system to alloc 1 cdev into dev variable
     if (alloc_chrdev_region(&dev, 0, cdevice_count, DRIVER_NAME) != 0) {
         printk("fail to alloc chrdev\n");
         ret = -EFAULT;
         goto out;
     }
 
+    // we get ready major which assigned from kernel
     cdevice_major = MAJOR(dev);
     cdev_init(&cdevice_cdev, &cdevice_fops);
     cdevice_cdev.owner = THIS_MODULE;
+    cdevice_cdev.ops = &cdevice_fops;
 
-    if (cdev_add(&cdevice_cdev, MKDEV(cdevice_major, 0), cdevice_count) != 0) {
+    // add 1 cdev to cdevice_cdev
+    if (cdev_add(&cdevice_cdev, MKDEV(cdevice_major, cdevice_minor), 1) != 0) {
         printk("fail to add cdevice\n");
         ret = -EFAULT;
         goto unreg_cdev;
     }
-    printk(KERN_ALERT "%s driver(%d:%d) loaded\n", DRIVER_NAME, MAJOR(dev), MINOR(dev));
 
-/*del_cdev:*/
-    /*cdev_del(&cdevice_cdev);*/
+    // register class for udev
+    cdevice_class = class_create(THIS_MODULE, DRIVER_NAME);
+    if (IS_ERR(cdevice_class)) {
+        printk("fail to create class\n");
+        goto del_cdev;
+    }
+    // save dev_t from major
+    cdevice_devt = MKDEV(cdevice_major, cdevice_minor);
+    device_create(cdevice_class, NULL, cdevice_devt,
+            NULL, "cdevice%d", cdevice_minor);
+    printk(KERN_ALERT "%s driver(%d:%d) loaded\n", DRIVER_NAME, MAJOR(cdevice_devt), MINOR(cdevice_devt));
+    return ret;
+
+del_cdev:
+    cdev_del(&cdevice_cdev);
 unreg_cdev:
     unregister_chrdev_region(dev, cdevice_count);
 out:
@@ -144,6 +167,10 @@ out:
 static void cdevice_exit(void)
 {
     dev_t dev = MKDEV(cdevice_major, 0);
+
+    // unregister class
+    device_destroy(cdevice_class, cdevice_devt);
+    class_destroy(cdevice_class);
 
     cdev_del(&cdevice_cdev);
     unregister_chrdev_region(dev, cdevice_count);
