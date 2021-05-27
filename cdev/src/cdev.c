@@ -12,20 +12,17 @@
 MODULE_LICENSE("Dual BSD/GPL");
 
 #define DRIVER_NAME "cdevice"
+// device count
+#define DEVICE_NUMS 4
 
 // 0 is dynamic allocation
 static int cdevice_major = 0;
-// 0 is static assign
-static int cdevice_minor = 0;
-// device count
-static int cdevice_count = 1;
 // accept param when insmod
 module_param(cdevice_major, uint, 0);
 // global device status
 static struct cdev cdevice_cdev;
 // class for udev
 static struct class *cdevice_class = NULL;
-static dev_t cdevice_devt;
 
 struct cdevice_data {
     unsigned char val;
@@ -45,7 +42,7 @@ static int cdevice_open(struct inode *inode, struct file *file)
         goto out;
     }
 
-    p->val = 0xff;
+    p->val = 0xff - iminor(inode);
     rwlock_init(&p->lock);
     file->private_data = p;
 out:
@@ -120,11 +117,12 @@ struct file_operations cdevice_fops = {
 static int cdevice_init(void)
 {
     int ret = 0;
+    int i = 0;
     // just create dev_t
     dev_t dev = MKDEV(cdevice_major, 0);
 
     // ask system to alloc 1 cdev into dev variable
-    if (alloc_chrdev_region(&dev, 0, cdevice_count, DRIVER_NAME) != 0) {
+    if (alloc_chrdev_region(&dev, 0, DEVICE_NUMS, DRIVER_NAME) != 0) {
         printk("fail to alloc chrdev\n");
         ret = -EFAULT;
         goto out;
@@ -136,8 +134,8 @@ static int cdevice_init(void)
     cdevice_cdev.owner = THIS_MODULE;
     cdevice_cdev.ops = &cdevice_fops;
 
-    // add 1 cdev to cdevice_cdev
-    if (cdev_add(&cdevice_cdev, MKDEV(cdevice_major, cdevice_minor), 1) != 0) {
+    // add 4 cdev to cdevice_cdev
+    if (cdev_add(&cdevice_cdev, dev, DEVICE_NUMS) != 0) {
         printk("fail to add cdevice\n");
         ret = -EFAULT;
         goto unreg_cdev;
@@ -149,32 +147,39 @@ static int cdevice_init(void)
         printk("fail to create class\n");
         goto del_cdev;
     }
-    // save dev_t from major
-    cdevice_devt = MKDEV(cdevice_major, cdevice_minor);
-    device_create(cdevice_class, NULL, cdevice_devt,
-            NULL, "cdevice%d", cdevice_minor);
-    printk(KERN_ALERT "%s driver(%d:%d) loaded\n", DRIVER_NAME, MAJOR(cdevice_devt), MINOR(cdevice_devt));
+    for (i = 0; i < DEVICE_NUMS; i++) {
+        // save dev_t from major
+        dev_t devone = MKDEV(cdevice_major, i);
+        device_create(cdevice_class, NULL, devone,
+                NULL, DRIVER_NAME"%d", i);
+        printk(KERN_ALERT "%s driver(%d:%d) loaded\n", DRIVER_NAME, MAJOR(devone), MINOR(devone));
+    }
     return ret;
 
 del_cdev:
     cdev_del(&cdevice_cdev);
 unreg_cdev:
-    unregister_chrdev_region(dev, cdevice_count);
+    unregister_chrdev_region(dev, DEVICE_NUMS);
 out:
     return ret;
 }
 
 static void cdevice_exit(void)
 {
-    dev_t dev = MKDEV(cdevice_major, 0);
+    int i = 0;
+    dev_t dev;
 
-    // unregister class
-    device_destroy(cdevice_class, cdevice_devt);
+    for (i = 0; i < DEVICE_NUMS; ++i) {
+        dev = MKDEV(cdevice_major, i);
+        // unregister class
+        device_destroy(cdevice_class, dev);
+    }
     class_destroy(cdevice_class);
 
+    dev = MKDEV(cdevice_major, 0);
     cdev_del(&cdevice_cdev);
-    unregister_chrdev_region(dev, cdevice_count);
-    printk(KERN_ALERT "%s driver(%d:%d) unloaded\n", DRIVER_NAME, MAJOR(dev), MINOR(dev));
+    unregister_chrdev_region(dev, DEVICE_NUMS);
+    printk(KERN_ALERT "%s driver(%d) unloaded\n", DRIVER_NAME, MAJOR(dev));
 }
 
 module_init(cdevice_init);
