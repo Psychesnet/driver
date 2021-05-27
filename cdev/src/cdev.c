@@ -8,6 +8,8 @@
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
+#include <linux/poll.h>
+#include "cdev_ioctl.h"
 
 MODULE_LICENSE("Dual BSD/GPL");
 
@@ -107,11 +109,65 @@ out:
     return read_count;
 }
 
+long cdevice_ioctl(struct file *file,
+        unsigned int cmd, unsigned long arg)
+{
+    struct cdevice_data *p = file->private_data;
+    int ret = 0;
+    struct ioctl_cmd data;
+
+    memset(&data, 0x00, sizeof(data));
+
+    switch (cmd) {
+        case IOCTL_SET_VAL:
+            if (!capable(CAP_SYS_ADMIN)) {
+                printk("permission deny\n");
+                ret = -EPERM;
+                break;
+            }
+            if (!access_ok((void __user *)arg, _IOC_SIZE(cmd))) {
+                printk("memory is not access\n");
+                ret = -EFAULT;
+                break;
+            }
+            if (copy_from_user(&data, (int __user *)arg, sizeof(data))) {
+                printk("fail to copy data from user\n");
+                ret = -EFAULT;
+                break;
+            }
+            printk("ioctl: %d, set val: 0x%x\n", data.val);
+            write_lock(&p->lock);
+            p->val = data.val;
+            write_unlock(&p->lock);
+            break;
+        case IOCTL_GET_VAL:
+            if (!access_ok((void __user *)arg, _IOC_SIZE(cmd))) {
+                printk("memory is not access\n");
+                ret = -EFAULT;
+                break;
+            }
+            read_lock(&p->lock);
+            data.val = p->val;
+            read_unlock(&p->lock);
+            if (copy_to_user((int __user *)arg, &data, sizeof(data))) {
+                printk("fail to copy data to user\n");
+                ret = -EFAULT;
+                break;
+            }
+            break;
+        default:
+            ret = -ENOTTY;
+            break;
+    }
+    return ret;
+}
+
 struct file_operations cdevice_fops = {
     .open = cdevice_open,
     .release = cdevice_close,
     .write = cdevice_write,
     .read = cdevice_read,
+    .unlocked_ioctl = cdevice_ioctl,
 };
 
 static int cdevice_init(void)

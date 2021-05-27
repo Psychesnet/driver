@@ -48,7 +48,22 @@ define Build/Compile
 	$(MAKE) $(MAKEOPTS)
 endef
 
+define Build/InstallDev
+    $(MAKE) -C $(PKG_BUILD_DIR) \
+    	CP="$(CP)" \
+        LN="$(LN)" \
+        INSTALL_BIN="$(INSTALL_BIN)" \
+        INSTALL_DIR="$(INSTALL_DIR)" \
+        INSTALL_DATA="$(INSTALL_DATA)" \
+        INSTALL_CONF="$(INSTALL_CONF)" \
+        PKG_BUILD_DIR="$(PKG_BUILD_DIR)" \
+        PKG_VERSION="$(PKG_VERSION)" \
+        $(BUILD_OPTIONS) \
+        DES_DIR="$(1)" header
+endef
+
 define KernelPackage/$(PKG_NAME)/install
+	echo install
 endef
 
 $(eval $(call KernelPackage,$(PKG_NAME)))
