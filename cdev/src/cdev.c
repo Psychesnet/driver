@@ -170,8 +170,11 @@ ssize_t cdevice_read(struct file *file, char __user *buf,
         // blocking mode
         do {
              ret = wait_event_interruptible_timeout(
-                     p->wait_queue, p->timeout_done == 1, 1*HZ);
+                     p->wait_queue,
+                     p->timeout_done == 1,
+                     1*HZ);
              if (ret == -ERESTARTSYS) {
+                 // another process interrupt us
                  return -ERESTARTSYS;
              }
         } while (ret == 0); // if timeout, do it again
